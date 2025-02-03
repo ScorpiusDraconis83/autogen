@@ -72,6 +72,7 @@ from openai.types.shared_params import FunctionDefinition, FunctionParameters
 from pydantic import BaseModel
 from typing_extensions import Self, Unpack
 
+from .._utils.parse_r1_content import parse_r1_content
 from . import _model_info
 from .config import (
     AzureOpenAIClientConfiguration,
@@ -336,6 +337,10 @@ def normalize_stop_reason(stop_reason: str | None) -> FinishReasons:
     stop_reason = stop_reason.lower()
 
     KNOWN_STOP_MAPPINGS: Dict[str, FinishReasons] = {
+        "stop": "stop",
+        "length": "length",
+        "content_filter": "content_filter",
+        "function_calls": "function_calls",
         "end_turn": "stop",
         "tool_calls": "function_calls",
     }
@@ -373,11 +378,14 @@ class BaseOpenAIChatCompletionClient(ChatCompletionClient):
             self._resolved_model = _model_info.resolve_model(create_args["model"])
 
         if (
-            "response_format" in create_args
-            and create_args["response_format"]["type"] == "json_object"
-            and not self._model_info["json_output"]
+            not self._model_info["json_output"]
+            and "response_format" in create_args
+            and (
+                isinstance(create_args["response_format"], dict)
+                and create_args["response_format"]["type"] == "json_object"
+            )
         ):
-            raise ValueError("Model does not support JSON output")
+            raise ValueError("Model does not support JSON output.")
 
         self._create_args = create_args
         self._total_usage = RequestUsage(prompt_tokens=0, completion_tokens=0)
@@ -433,7 +441,7 @@ class BaseOpenAIChatCompletionClient(ChatCompletionClient):
 
         if json_output is not None:
             if self.model_info["json_output"] is False and json_output is True:
-                raise ValueError("Model does not support JSON output")
+                raise ValueError("Model does not support JSON output.")
 
             if json_output is True:
                 create_args["response_format"] = {"type": "json_object"}
@@ -441,7 +449,7 @@ class BaseOpenAIChatCompletionClient(ChatCompletionClient):
                 create_args["response_format"] = {"type": "text"}
 
         if self.model_info["json_output"] is False and json_output is True:
-            raise ValueError("Model does not support JSON output")
+            raise ValueError("Model does not support JSON output.")
 
         oai_messages_nested = [to_oai_type(m) for m in messages]
         oai_messages = [item for sublist in oai_messages_nested for item in sublist]
@@ -536,33 +544,57 @@ class BaseOpenAIChatCompletionClient(ChatCompletionClient):
         if self._resolved_model is not None:
             if self._resolved_model != result.model:
                 warnings.warn(
-                    f"Resolved model mismatch: {self._resolved_model} != {result.model}. Model mapping may be incorrect.",
+                    f"Resolved model mismatch: {self._resolved_model} != {result.model}. "
+                    "Model mapping in autogen_ext.models.openai may be incorrect.",
                     stacklevel=2,
                 )
 
         # Limited to a single choice currently.
         choice: Union[ParsedChoice[Any], ParsedChoice[BaseModel], Choice] = result.choices[0]
-        if choice.finish_reason == "function_call":
-            raise ValueError("Function calls are not supported in this context")
 
+        # Detect whether it is a function call or not.
+        # We don't rely on choice.finish_reason as it is not always accurate, depending on the API used.
         content: Union[str, List[FunctionCall]]
-        if choice.finish_reason == "tool_calls":
-            assert choice.message.tool_calls is not None
-            assert choice.message.function_call is None
-
-            # NOTE: If OAI response type changes, this will need to be updated
-            content = [
-                FunctionCall(
-                    id=x.id,
-                    arguments=x.function.arguments,
-                    name=normalize_name(x.function.name),
+        if choice.message.function_call is not None:
+            raise ValueError("function_call is deprecated and is not supported by this model client.")
+        elif choice.message.tool_calls is not None and len(choice.message.tool_calls) > 0:
+            if choice.finish_reason != "tool_calls":
+                warnings.warn(
+                    f"Finish reason mismatch: {choice.finish_reason} != tool_calls "
+                    "when tool_calls are present. Finish reason may not be accurate. "
+                    "This may be due to the API used that is not returning the correct finish reason.",
+                    stacklevel=2,
                 )
-                for x in choice.message.tool_calls
-            ]
-            finish_reason = "function_calls"
+            if choice.message.content is not None and choice.message.content != "":
+                warnings.warn(
+                    "Both tool_calls and content are present in the message. "
+                    "This is unexpected. content will be ignored, tool_calls will be used.",
+                    stacklevel=2,
+                )
+            # NOTE: If OAI response type changes, this will need to be updated
+            content = []
+            for tool_call in choice.message.tool_calls:
+                if not isinstance(tool_call.function.arguments, str):
+                    warnings.warn(
+                        f"Tool call function arguments field is not a string: {tool_call.function.arguments}."
+                        "This is unexpected and may due to the API used not returning the correct type. "
+                        "Attempting to convert it to string.",
+                        stacklevel=2,
+                    )
+                    if isinstance(tool_call.function.arguments, dict):
+                        tool_call.function.arguments = json.dumps(tool_call.function.arguments)
+                content.append(
+                    FunctionCall(
+                        id=tool_call.id,
+                        arguments=tool_call.function.arguments,
+                        name=normalize_name(tool_call.function.name),
+                    )
+                )
+            finish_reason = "tool_calls"
         else:
             finish_reason = choice.finish_reason
             content = choice.message.content or ""
+
         logprobs: Optional[List[ChatCompletionTokenLogprob]] = None
         if choice.logprobs and choice.logprobs.content:
             logprobs = [
@@ -574,12 +606,19 @@ class BaseOpenAIChatCompletionClient(ChatCompletionClient):
                 )
                 for x in choice.logprobs.content
             ]
+
+        if isinstance(content, str) and self._model_info["family"] == ModelFamily.R1:
+            thought, content = parse_r1_content(content)
+        else:
+            thought = None
+
         response = CreateResult(
-            finish_reason=finish_reason,  # type: ignore
+            finish_reason=normalize_stop_reason(finish_reason),
             content=content,
             usage=usage,
             cached=False,
             logprobs=logprobs,
+            thought=thought,
         )
 
         self._total_usage = _add_usage(self._total_usage, usage)
@@ -607,7 +646,7 @@ class BaseOpenAIChatCompletionClient(ChatCompletionClient):
             json_output (Optional[bool], optional): If True, the output will be in JSON format. Defaults to None.
             extra_create_args (Mapping[str, Any], optional): Additional arguments for the creation process. Default to `{}`.
             cancellation_token (Optional[CancellationToken], optional): A token to cancel the operation. Defaults to None.
-            max_consecutive_empty_chunk_tolerance (int): The maximum number of consecutive empty chunks to tolerate before raising a ValueError. This seems to only be needed to set when using `AzureOpenAIChatCompletionClient`. Defaults to 0.
+            max_consecutive_empty_chunk_tolerance (int): [Deprecated] The maximum number of consecutive empty chunks to tolerate before raising a ValueError. This seems to only be needed to set when using `AzureOpenAIChatCompletionClient`. Defaults to 0. This parameter is deprecated, empty chunks will be skipped.
 
         Yields:
             AsyncGenerator[Union[str, CreateResult], None]: A generator yielding the completion results as they are produced.
@@ -678,6 +717,15 @@ class BaseOpenAIChatCompletionClient(ChatCompletionClient):
         full_tool_calls: Dict[int, FunctionCall] = {}
         completion_tokens = 0
         logprobs: Optional[List[ChatCompletionTokenLogprob]] = None
+
+        if max_consecutive_empty_chunk_tolerance != 0:
+            warnings.warn(
+                "The 'max_consecutive_empty_chunk_tolerance' parameter is deprecated and will be removed in the future releases. All of empty chunks will be skipped with a warning.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        empty_chunk_warning_has_been_issued: bool = False
+        empty_chunk_warning_threshold: int = 10
         empty_chunk_count = 0
 
         while True:
@@ -687,16 +735,16 @@ class BaseOpenAIChatCompletionClient(ChatCompletionClient):
                     cancellation_token.link_future(chunk_future)
                 chunk = await chunk_future
 
-                # This is to address a bug in AzureOpenAIChatCompletionClient. OpenAIChatCompletionClient works fine.
+                # Empty chunks has been observed when the endpoint is under heavy load.
                 #  https://github.com/microsoft/autogen/issues/4213
                 if len(chunk.choices) == 0:
                     empty_chunk_count += 1
-                    if max_consecutive_empty_chunk_tolerance == 0:
-                        raise ValueError(
-                            "Consecutive empty chunks found. Change max_empty_consecutive_chunk_tolerance to increase empty chunk tolerance"
+                    if not empty_chunk_warning_has_been_issued and empty_chunk_count >= empty_chunk_warning_threshold:
+                        empty_chunk_warning_has_been_issued = True
+                        warnings.warn(
+                            f"Received more than {empty_chunk_warning_threshold} consecutive empty chunks. Empty chunks are being ignored.",
+                            stacklevel=2,
                         )
-                    elif empty_chunk_count >= max_consecutive_empty_chunk_tolerance:
-                        raise ValueError("Exceeded the threshold of receiving consecutive empty chunks")
                     continue
                 else:
                     empty_chunk_count = 0
@@ -787,12 +835,18 @@ class BaseOpenAIChatCompletionClient(ChatCompletionClient):
             completion_tokens=completion_tokens,
         )
 
+        if isinstance(content, str) and self._model_info["family"] == ModelFamily.R1:
+            thought, content = parse_r1_content(content)
+        else:
+            thought = None
+
         result = CreateResult(
             finish_reason=normalize_stop_reason(stop_reason),
             content=content,
             usage=usage,
             cached=False,
             logprobs=logprobs,
+            thought=thought,
         )
 
         self._total_usage = _add_usage(self._total_usage, usage)
@@ -937,6 +991,7 @@ class OpenAIChatCompletionClient(BaseOpenAIChatCompletionClient, Component[OpenA
         temperature (optional, float):
         top_p (optional, float):
         user (optional, str):
+        default_headers (optional, dict[str, str]):  Custom headers; useful for authentication or other custom requirements.
 
 
     To use this client, you must install the `openai` extension:
@@ -961,20 +1016,23 @@ class OpenAIChatCompletionClient(BaseOpenAIChatCompletionClient, Component[OpenA
         print(result)
 
 
-    To use the client with a non-OpenAI model, you need to provide the base URL of the model and the model capabilities:
+    To use the client with a non-OpenAI model, you need to provide the base URL of the model and the model info.
+    For example, to use Ollama, you can use the following code snippet:
 
     .. code-block:: python
 
         from autogen_ext.models.openai import OpenAIChatCompletionClient
+        from autogen_core.models import ModelFamily
 
         custom_model_client = OpenAIChatCompletionClient(
-            model="custom-model-name",
-            base_url="https://custom-model.com/reset/of/the/path",
+            model="deepseek-r1:1.5b",
+            base_url="http://localhost:11434/v1",
             api_key="placeholder",
-            model_capabilities={
-                "vision": True,
-                "function_calling": True,
-                "json_output": True,
+            model_info={
+                "vision": False,
+                "function_calling": False,
+                "json_output": False,
+                "family": ModelFamily.R1,
             },
         )
 
@@ -1068,6 +1126,8 @@ class AzureOpenAIChatCompletionClient(
         temperature (optional, float):
         top_p (optional, float):
         user (optional, str):
+        default_headers (optional, dict[str, str]):  Custom headers; useful for authentication or other custom requirements.
+
 
 
     To use this client, you must install the `azure` and `openai` extensions:

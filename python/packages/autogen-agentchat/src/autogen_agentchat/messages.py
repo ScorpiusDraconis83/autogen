@@ -9,7 +9,7 @@ from typing import List, Literal
 
 from autogen_core import FunctionCall, Image
 from autogen_core.memory import MemoryContent
-from autogen_core.models import FunctionExecutionResult, RequestUsage
+from autogen_core.models import FunctionExecutionResult, LLMMessage, RequestUsage
 from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import Annotated
 
@@ -74,6 +74,9 @@ class HandoffMessage(BaseChatMessage):
     content: str
     """The handoff message to the target agent."""
 
+    context: List[LLMMessage] = []
+    """The model context to be passed to the target agent."""
+
     type: Literal["HandoffMessage"] = "HandoffMessage"
 
 
@@ -125,6 +128,15 @@ class MemoryQueryEvent(BaseAgentEvent):
     type: Literal["MemoryQueryEvent"] = "MemoryQueryEvent"
 
 
+class ModelClientStreamingChunkEvent(BaseAgentEvent):
+    """An event signaling a text output chunk from a model client in streaming mode."""
+
+    content: str
+    """The partial text chunk."""
+
+    type: Literal["ModelClientStreamingChunkEvent"] = "ModelClientStreamingChunkEvent"
+
+
 ChatMessage = Annotated[
     TextMessage | MultiModalMessage | StopMessage | ToolCallSummaryMessage | HandoffMessage, Field(discriminator="type")
 ]
@@ -132,7 +144,11 @@ ChatMessage = Annotated[
 
 
 AgentEvent = Annotated[
-    ToolCallRequestEvent | ToolCallExecutionEvent | MemoryQueryEvent | UserInputRequestedEvent,
+    ToolCallRequestEvent
+    | ToolCallExecutionEvent
+    | MemoryQueryEvent
+    | UserInputRequestedEvent
+    | ModelClientStreamingChunkEvent,
     Field(discriminator="type"),
 ]
 """Events emitted by agents and teams when they work, not used for agent-to-agent communication."""
@@ -151,4 +167,5 @@ __all__ = [
     "ToolCallSummaryMessage",
     "MemoryQueryEvent",
     "UserInputRequestedEvent",
+    "ModelClientStreamingChunkEvent",
 ]
